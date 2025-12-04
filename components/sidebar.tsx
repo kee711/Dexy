@@ -6,6 +6,7 @@ import { useState } from "react";
 import {
   GalleryVerticalEnd,
   House,
+  KeyRound,
   PanelLeft,
   PanelRight,
   Plus,
@@ -25,6 +26,7 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
   const pathname = usePathname();
   const isHome = pathname === "/";
   const isAgents = pathname?.startsWith("/agents");
+  const isApiKeys = pathname?.startsWith("/api-keys");
   const [hovered, setHovered] = useState(false);
 
   const items = [
@@ -49,6 +51,12 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
       icon: <GalleryVerticalEnd className="h-4 w-4" />,
       href: "/agents",
       active: isAgents,
+    },
+    {
+      label: "API Keys",
+      icon: <KeyRound className="h-4 w-4" />,
+      href: "/api-keys",
+      active: isApiKeys,
     },
   ];
 
