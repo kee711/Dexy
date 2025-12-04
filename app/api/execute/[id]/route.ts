@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { NextRequest, NextResponse } from "next/server";
+import { createHash, randomUUID } from "crypto";
 import { createClient } from "@/lib/supabase/server";
+import { createServiceClient } from "@/lib/supabase/service";
 import { createPublicClient, http, parseAbiItem, decodeEventLog } from "viem";
 import { baseSepolia } from "viem/chains";
 
@@ -41,10 +43,83 @@ type PaymentSettlementResult = {
   to: string;
 };
 
+type ApiKeyRecord = {
+  id: string;
+  user_id: string;
+  revoked_at: string | null;
+};
+
+type ApiKeyContext = {
+  apiKeyId: string;
+  userId: string;
+};
+
+function hashApiKey(key: string) {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+async function validateApiKey(req: NextRequest): Promise<ApiKeyContext | null> {
+  const authHeader = req.headers.get("authorization") ?? "";
+  if (!authHeader.toLowerCase().startsWith("bearer ")) return null;
+
+  const rawKey = authHeader.slice(7).trim();
+  if (!rawKey) return null;
+
+  try {
+    const service = createServiceClient();
+    const keyHash = hashApiKey(rawKey);
+
+    const { data, error } = await service
+      .from("api_keys")
+      .select("id, user_id, revoked_at")
+      .eq("key_hash", keyHash)
+      .maybeSingle<ApiKeyRecord>();
+
+    if (error || !data || data.revoked_at) return null;
+
+    // Update last_used_at asynchronously; ignore failures.
+    service
+      .from("api_keys")
+      .update({ last_used_at: new Date().toISOString() })
+      .eq("id", data.id)
+      .then(() => {})
+      .catch(() => {});
+
+    return { apiKeyId: data.id, userId: data.user_id };
+  } catch (error) {
+    console.error("[execute] api key validation failed", error);
+    return null;
+  }
+}
+
+async function logApiKeyUsage(params: {
+  apiKeyId: string;
+  userId: string;
+  agentId: string;
+  amount: number;
+  status?: string;
+  requestId?: string | null;
+}) {
+  try {
+    const service = createServiceClient();
+    await service.from("api_key_usage").insert({
+      api_key_id: params.apiKeyId,
+      user_id: params.userId,
+      agent_id: params.agentId,
+      amount: Number.isFinite(params.amount) ? params.amount : 0,
+      status: params.status ?? "captured",
+      request_id: params.requestId ?? randomUUID(),
+    });
+  } catch (error) {
+    console.error("[execute] failed to log api_key_usage", error);
+  }
+}
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ id: string }> } | any
 ) {
+  const startedAt = Date.now();
   const params = await context.params;
   const agentId = params.id as string;
 
@@ -87,6 +162,20 @@ export async function POST(
   const usdcAddress =
     process.env.BASE_SEPOLIA_USDC_ADDRESS ||
     "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+
+  const apiKeyContext = await validateApiKey(req);
+  if (apiKeyContext) {
+    await logApiKeyUsage({
+      apiKeyId: apiKeyContext.apiKeyId,
+      userId: apiKeyContext.userId,
+      agentId,
+      amount: priceNumber,
+      status: priceNumber > 0 ? "captured" : "free",
+      requestId: req.headers.get("x-request-id"),
+    });
+
+    return proxyToUpstream(req, upstreamUrl);
+  }
 
   // 🔹 가격이 0이면 그냥 프록시 실행
   if (priceUnits === BigInt(0)) {
@@ -145,7 +234,7 @@ export async function POST(
   }
 
   // 🔹 결제가 유효하면 upstream 에이전트 호출
-  const resp = await proxyToUpstream(req, upstreamUrl);
+  const resp = await proxyToUpstream(req, upstreamUrl, startedAt);
 
   // 🔹 결제 settlement 정보를 헤더로 인코딩해서 내려줌
   if (settlement) {
@@ -157,7 +246,11 @@ export async function POST(
   return resp;
 }
 
-async function proxyToUpstream(req: NextRequest, upstreamUrl: string) {
+async function proxyToUpstream(
+  req: NextRequest,
+  upstreamUrl: string,
+  startedAt: number
+) {
   try {
     let body: any = undefined;
     try {
@@ -174,13 +267,45 @@ async function proxyToUpstream(req: NextRequest, upstreamUrl: string) {
       body: body ? JSON.stringify(body) : undefined,
     });
 
-    const text = await upstreamRes.text();
+    const rawText = await upstreamRes.text();
+    const usage = {
+      tokens: 0,
+      cost: 0,
+      latencyMs: Date.now() - startedAt,
+    };
 
-    return new NextResponse(text, {
+    const contentType = upstreamRes.headers.get("content-type") || "";
+    let parsed: any = null;
+    if (contentType.includes("application/json")) {
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const normalizedOutput =
+        parsed?.normalized?.output ?? parsed?.output ?? parsed?.result ?? rawText;
+      const enriched = {
+        ...parsed,
+        usage,
+        normalized: {
+          ...(parsed?.normalized ?? {}),
+          usage,
+          output: normalizedOutput,
+        },
+      };
+
+      return NextResponse.json(enriched, {
+        status: upstreamRes.status,
+      });
+    }
+
+    return new NextResponse(rawText, {
       status: upstreamRes.status,
       headers: {
-        "content-type":
-          upstreamRes.headers.get("content-type") || "application/json",
+        "content-type": contentType || "application/json",
       },
     });
   } catch (e: any) {
