@@ -54,6 +54,11 @@ type ApiKeyContext = {
   userId: string;
 };
 
+function estimateTokens(text: string) {
+  // Rough heuristic: ~4 chars per token
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
 function hashApiKey(key: string) {
   return createHash("sha256").update(key).digest("hex");
 }
@@ -78,12 +83,16 @@ async function validateApiKey(req: NextRequest): Promise<ApiKeyContext | null> {
     if (error || !data || data.revoked_at) return null;
 
     // Update last_used_at asynchronously; ignore failures.
-    service
-      .from("api_keys")
-      .update({ last_used_at: new Date().toISOString() })
-      .eq("id", data.id)
-      .then(() => {})
-      .catch(() => {});
+    (async () => {
+      try {
+        await service
+          .from("api_keys")
+          .update({ last_used_at: new Date().toISOString() })
+          .eq("id", data.id);
+      } catch (err) {
+        console.error("[execute] failed to update api_keys.last_used_at", err);
+      }
+    })();
 
     return { apiKeyId: data.id, userId: data.user_id };
   } catch (error) {
@@ -97,16 +106,26 @@ async function logApiKeyUsage(params: {
   userId: string;
   agentId: string;
   amount: number;
+  tokens?: number;
+  cost?: number;
+  latencyMs?: number;
   status?: string;
   requestId?: string | null;
 }) {
   try {
     const service = createServiceClient();
+    const amount = Number(params.amount);
+    const tokens = Number(params.tokens ?? 0);
+    const cost = Number(params.cost ?? 0);
+    const latency = Number(params.latencyMs ?? 0);
     await service.from("api_key_usage").insert({
       api_key_id: params.apiKeyId,
       user_id: params.userId,
       agent_id: params.agentId,
-      amount: Number.isFinite(params.amount) ? params.amount : 0,
+      amount: Number.isFinite(amount) ? Number(amount.toFixed(3)) : 0,
+      tokens: Number.isFinite(tokens) ? Math.round(tokens) : 0,
+      cost: Number.isFinite(cost) ? Number(cost.toFixed(3)) : 0,
+      latency_ms: Number.isFinite(latency) ? Math.round(latency) : 0,
       status: params.status ?? "captured",
       request_id: params.requestId ?? randomUUID(),
     });
@@ -165,22 +184,34 @@ export async function POST(
 
   const apiKeyContext = await validateApiKey(req);
   if (apiKeyContext) {
+    const { response, usage } = await proxyToUpstream(
+      req,
+      upstreamUrl,
+      startedAt
+    );
+
+    const usageCost = Number.isFinite(usage.cost) ? usage.cost : priceNumber;
+
     await logApiKeyUsage({
       apiKeyId: apiKeyContext.apiKeyId,
       userId: apiKeyContext.userId,
       agentId,
       amount: priceNumber,
+      cost: usageCost,
+      tokens: usage.tokens,
+      latencyMs: usage.latencyMs,
       status: priceNumber > 0 ? "captured" : "free",
       requestId: req.headers.get("x-request-id"),
     });
 
-    return proxyToUpstream(req, upstreamUrl);
+    return response;
   }
 
   // 🔹 가격이 0이면 그냥 프록시 실행
   if (priceUnits === BigInt(0)) {
     console.log("price = 0 → free execution, skipping payment");
-    return proxyToUpstream(req, upstreamUrl);
+    const { response } = await proxyToUpstream(req, upstreamUrl, startedAt);
+    return response;
   }
 
   const paymentRequirements = buildDirectPaymentRequirements({
@@ -234,7 +265,11 @@ export async function POST(
   }
 
   // 🔹 결제가 유효하면 upstream 에이전트 호출
-  const resp = await proxyToUpstream(req, upstreamUrl, startedAt);
+  const { response: resp } = await proxyToUpstream(
+    req,
+    upstreamUrl,
+    startedAt
+  );
 
   // 🔹 결제 settlement 정보를 헤더로 인코딩해서 내려줌
   if (settlement) {
@@ -250,7 +285,10 @@ async function proxyToUpstream(
   req: NextRequest,
   upstreamUrl: string,
   startedAt: number
-) {
+): Promise<{
+  response: NextResponse;
+  usage: { tokens: number; cost: number; latencyMs: number };
+}> {
   try {
     let body: any = undefined;
     try {
@@ -258,6 +296,9 @@ async function proxyToUpstream(
     } catch {
       body = undefined;
     }
+
+    const promptText =
+      body && typeof body === "object" ? JSON.stringify(body) : String(body ?? "");
 
     const upstreamRes = await fetch(upstreamUrl, {
       method: "POST",
@@ -268,10 +309,11 @@ async function proxyToUpstream(
     });
 
     const rawText = await upstreamRes.text();
-    const usage = {
-      tokens: 0,
-      cost: 0,
-      latencyMs: Date.now() - startedAt,
+    const latencyMs = Date.now() - startedAt;
+    const baseUsage = {
+      tokens: estimateTokens(promptText + rawText),
+      cost: priceNumber ? Number(priceNumber.toFixed(3)) : 0,
+      latencyMs,
     };
 
     const contentType = upstreamRes.headers.get("content-type") || "";
@@ -287,33 +329,59 @@ async function proxyToUpstream(
     if (parsed && typeof parsed === "object") {
       const normalizedOutput =
         parsed?.normalized?.output ?? parsed?.output ?? parsed?.result ?? rawText;
+      const upstreamUsage = parsed?.normalized?.usage ?? parsed?.usage;
+      const finalUsage = upstreamUsage
+        ? {
+            tokens: upstreamUsage.tokens ?? baseUsage.tokens,
+            cost: upstreamUsage.cost ?? baseUsage.cost,
+            latencyMs: upstreamUsage.latencyMs ?? baseUsage.latencyMs,
+          }
+        : baseUsage;
+
       const enriched = {
         ...parsed,
-        usage,
+        usage: finalUsage,
         normalized: {
           ...(parsed?.normalized ?? {}),
-          usage,
+          usage: finalUsage,
           output: normalizedOutput,
         },
       };
 
-      return NextResponse.json(enriched, {
-        status: upstreamRes.status,
-      });
+      return {
+        response: NextResponse.json(enriched, {
+          status: upstreamRes.status,
+        }),
+        usage: finalUsage,
+      };
     }
 
-    return new NextResponse(rawText, {
-      status: upstreamRes.status,
-      headers: {
-        "content-type": contentType || "application/json",
-      },
-    });
+    const normalized = {
+      output: rawText,
+      usage: baseUsage,
+      normalized: { output: rawText, usage: baseUsage },
+    };
+
+    return {
+      response: NextResponse.json(normalized, {
+        status: upstreamRes.status,
+      }),
+      usage: baseUsage,
+    };
   } catch (e: any) {
     console.error("Proxy to upstream failed:", e);
-    return NextResponse.json(
-      { ok: false, error: e.message ?? "Proxy error" },
-      { status: 500 }
-    );
+    const fallbackUsage = {
+      tokens: 0,
+      cost: 0,
+      latencyMs: Date.now() - startedAt,
+    };
+    return {
+      response: NextResponse.json(
+        { ok: false, error: e.message ?? "Proxy error" },
+        { status: 500 }
+      ),
+      usage: fallbackUsage,
+    };
   }
 }
 

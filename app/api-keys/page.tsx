@@ -17,7 +17,18 @@ type ApiKeyRow = {
 
 type UsageBar = {
   date: string;
-  total: number;
+  amount: number;
+  tokens: number;
+  cost: number;
+  latencyMs: number;
+  count: number;
+};
+
+type UsageTotals = {
+  amount: number;
+  tokens: number;
+  cost: number;
+  latencyMs: number;
   count: number;
 };
 
@@ -29,6 +40,13 @@ export default function ApiKeysPage() {
   const [plainKey, setPlainKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [usage, setUsage] = useState<UsageBar[]>([]);
+  const [usageTotals, setUsageTotals] = useState<UsageTotals>({
+    amount: 0,
+    tokens: 0,
+    cost: 0,
+    latencyMs: 0,
+    count: 0,
+  });
   const [usageLoading, setUsageLoading] = useState(false);
 
   const fetchKeys = async () => {
@@ -60,7 +78,25 @@ export default function ApiKeysPage() {
       const res = await fetch("/api/api-key-usage", { cache: "no-store" });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to load usage");
-      setUsage(Array.isArray(data?.daily) ? data.daily : []);
+      const daily: UsageBar[] = Array.isArray(data?.daily)
+        ? data.daily.map((row: any) => ({
+            date: row.date,
+            amount: Number(row.amount ?? 0),
+            tokens: Number(row.tokens ?? 0),
+            cost: Number(row.cost ?? row.amount ?? 0),
+            latencyMs: Number(row.latencyMs ?? row.latency_ms ?? 0),
+            count: Number(row.count ?? 0),
+          }))
+        : [];
+
+      setUsage(daily);
+      setUsageTotals({
+        amount: Number(data?.totals?.amount ?? 0),
+        tokens: Number(data?.totals?.tokens ?? 0),
+        cost: Number(data?.totals?.cost ?? 0),
+        latencyMs: Number(data?.totals?.latencyMs ?? 0),
+        count: Number(data?.totals?.count ?? 0),
+      });
     } catch (err: any) {
       console.error(err);
     } finally {
@@ -97,9 +133,31 @@ export default function ApiKeysPage() {
     return "";
   }, [loading, error]);
 
-  const maxTotal = useMemo(
-    () => usage.reduce((max, row) => Math.max(max, row.total), 0),
-    [usage]
+  const metrics = useMemo(
+    () => [
+      {
+        key: "tokens",
+        label: "Tokens",
+        accessor: (row: UsageBar) => row.tokens ?? 0,
+        format: (v: number) => v.toLocaleString(),
+        gradient: "from-indigo-300 to-indigo-600",
+      },
+      {
+        key: "cost",
+        label: "Cost (USD)",
+        accessor: (row: UsageBar) => row.cost ?? row.amount ?? 0,
+        format: (v: number) => `$${v.toFixed(2)}`,
+        gradient: "from-emerald-300 to-emerald-600",
+      },
+      {
+        key: "latencyMs",
+        label: "Latency (ms)",
+        accessor: (row: UsageBar) => row.latencyMs ?? 0,
+        format: (v: number) => `${Math.round(v)} ms`,
+        gradient: "from-amber-300 to-amber-600",
+      },
+    ],
+    []
   );
 
   return (
@@ -160,35 +218,64 @@ export default function ApiKeysPage() {
       </div>
 
       <Card className="p-4 shadow-sm">
-        <div className="flex items-center gap-2 pb-2">
+        <div className="flex items-center gap-2 pb-3">
           <BarChart3 className="h-4 w-4 text-gray-500" />
-          <p className="text-sm font-semibold text-gray-800">Usage (last 30 days)</p>
+          <div className="flex flex-col">
+            <p className="text-sm font-semibold text-gray-800">Usage (last 30 days)</p>
+            <p className="text-xs text-gray-500">Daily totals for tokens, cost, and latency.</p>
+          </div>
           {usageLoading ? <Loader2 className="h-4 w-4 animate-spin text-gray-500" /> : null}
         </div>
-        <div className="mt-3 flex h-48 items-end gap-2 overflow-x-auto rounded-lg border bg-gray-50 p-3">
-          {!usage.length ? (
-            <p className="text-sm text-gray-600">No usage yet.</p>
-          ) : (
-            usage.map((row) => {
-              const height = maxTotal ? Math.max(8, (row.total / maxTotal) * 150) : 8;
+
+        {!usage.length ? (
+          <p className="text-sm text-gray-600">No usage yet.</p>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-3">
+        {metrics.map((metric) => {
+          const maxValue = usage.reduce(
+            (max, row) => Math.max(max, metric.accessor(row)),
+            0
+          );
+              const totalValue =
+                metric.key === "tokens"
+                  ? usageTotals.tokens
+                  : metric.key === "cost"
+                    ? usageTotals.cost
+                    : usageTotals.latencyMs;
+
               return (
-                <div key={row.date} className="flex flex-col items-center gap-2 text-xs text-gray-700">
-                  <div
-                    className="w-8 rounded bg-gradient-to-t from-gray-300 to-gray-600"
-                    style={{ height }}
-                    title={`${row.date}: ${row.total.toFixed(2)} (${row.count} calls)`}
-                  />
-                  <span className="text-[10px] text-gray-500">{row.date.slice(5)}</span>
+                <div key={metric.key} className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between text-xs text-gray-700">
+                    <span className="font-semibold">{metric.label}</span>
+                    <span className="text-gray-500">total {metric.format(totalValue)}</span>
+                  </div>
+                  <div className="flex h-40 items-end gap-1.5 rounded-md border bg-gray-50 p-2">
+                    {usage.map((row) => {
+                      const value = metric.accessor(row);
+                      const height = maxValue ? Math.max(8, (value / maxValue) * 120) : 8;
+                      return (
+                        <div
+                          key={`${metric.key}-${row.date}`}
+                          className="flex flex-col items-center gap-1 text-[10px] text-gray-600"
+                        >
+                          <div
+                            className={`w-7 rounded bg-gradient-to-t ${metric.gradient}`}
+                            style={{ height }}
+                            title={`${row.date}: ${metric.format(value)} • ${row.count} calls`}
+                          />
+                          <span className="text-[9px] text-gray-500">{row.date.slice(5)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] text-gray-600">
+                    Hover to see exact {metric.label.toLowerCase()} per day.
+                  </p>
                 </div>
               );
-            })
-          )}
-        </div>
-        {usage.length ? (
-          <p className="mt-2 text-[11px] text-gray-600">
-            Total = daily sum of amount; hover bars for counts.
-          </p>
-        ) : null}
+            })}
+          </div>
+        )}
       </Card>
 
       <div className="grid gap-3">
