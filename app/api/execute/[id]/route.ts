@@ -111,6 +111,8 @@ async function logApiKeyUsage(params: {
   latencyMs?: number;
   status?: string;
   requestId?: string | null;
+  prompt?: string;
+  normalizedOutput?: string;
 }) {
   try {
     const service = createServiceClient();
@@ -128,6 +130,10 @@ async function logApiKeyUsage(params: {
       latency_ms: Number.isFinite(latency) ? Math.round(latency) : 0,
       status: params.status ?? "captured",
       request_id: params.requestId ?? randomUUID(),
+      meta: {
+        prompt: params.prompt,
+        output: params.normalizedOutput,
+      },
     });
   } catch (error) {
     console.error("[execute] failed to log api_key_usage", error);
@@ -184,10 +190,11 @@ export async function POST(
 
   const apiKeyContext = await validateApiKey(req);
   if (apiKeyContext) {
-    const { response, usage } = await proxyToUpstream(
+    const { response, usage, promptText, normalizedOutput } = await proxyToUpstream(
       req,
       upstreamUrl,
-      startedAt
+      startedAt,
+      priceNumber
     );
 
     const usageCost = Number.isFinite(usage.cost) ? usage.cost : priceNumber;
@@ -202,6 +209,8 @@ export async function POST(
       latencyMs: usage.latencyMs,
       status: priceNumber > 0 ? "captured" : "free",
       requestId: req.headers.get("x-request-id"),
+      prompt: promptText,
+      normalizedOutput: normalizedOutput,
     });
 
     return response;
@@ -210,7 +219,7 @@ export async function POST(
   // 🔹 가격이 0이면 그냥 프록시 실행
   if (priceUnits === BigInt(0)) {
     console.log("price = 0 → free execution, skipping payment");
-    const { response } = await proxyToUpstream(req, upstreamUrl, startedAt);
+    const { response } = await proxyToUpstream(req, upstreamUrl, startedAt, priceNumber);
     return response;
   }
 
@@ -268,7 +277,8 @@ export async function POST(
   const { response: resp } = await proxyToUpstream(
     req,
     upstreamUrl,
-    startedAt
+    startedAt,
+    priceNumber
   );
 
   // 🔹 결제 settlement 정보를 헤더로 인코딩해서 내려줌
@@ -284,10 +294,13 @@ export async function POST(
 async function proxyToUpstream(
   req: NextRequest,
   upstreamUrl: string,
-  startedAt: number
+  startedAt: number,
+  priceNumber: number
 ): Promise<{
   response: NextResponse;
   usage: { tokens: number; cost: number; latencyMs: number };
+  promptText: string;
+  normalizedOutput: string;
 }> {
   try {
     let body: any = undefined;
@@ -332,10 +345,10 @@ async function proxyToUpstream(
       const upstreamUsage = parsed?.normalized?.usage ?? parsed?.usage;
       const finalUsage = upstreamUsage
         ? {
-            tokens: upstreamUsage.tokens ?? baseUsage.tokens,
-            cost: upstreamUsage.cost ?? baseUsage.cost,
-            latencyMs: upstreamUsage.latencyMs ?? baseUsage.latencyMs,
-          }
+          tokens: upstreamUsage.tokens ?? baseUsage.tokens,
+          cost: upstreamUsage.cost ?? baseUsage.cost,
+          latencyMs: upstreamUsage.latencyMs ?? baseUsage.latencyMs,
+        }
         : baseUsage;
 
       const enriched = {
@@ -353,6 +366,8 @@ async function proxyToUpstream(
           status: upstreamRes.status,
         }),
         usage: finalUsage,
+        promptText,
+        normalizedOutput: typeof normalizedOutput === 'string' ? normalizedOutput : JSON.stringify(normalizedOutput),
       };
     }
 
@@ -367,6 +382,8 @@ async function proxyToUpstream(
         status: upstreamRes.status,
       }),
       usage: baseUsage,
+      promptText,
+      normalizedOutput: rawText,
     };
   } catch (e: any) {
     console.error("Proxy to upstream failed:", e);
@@ -381,6 +398,8 @@ async function proxyToUpstream(
         { status: 500 }
       ),
       usage: fallbackUsage,
+      promptText: "",
+      normalizedOutput: "",
     };
   }
 }
