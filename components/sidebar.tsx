@@ -10,6 +10,7 @@ import {
   PanelLeft,
   PanelRight,
   Plus,
+  GitGraph,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import Image from "next/image";
@@ -27,6 +28,7 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
   const isHome = pathname === "/";
   const isAgents = pathname?.startsWith("/agents");
   const isApiKeys = pathname?.startsWith("/api-keys");
+  const isWorkflow = pathname?.startsWith("/workflow");
   const [hovered, setHovered] = useState(false);
 
   const items = [
@@ -51,6 +53,12 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
       icon: <GalleryVerticalEnd className="h-4 w-4" />,
       href: "/agents",
       active: isAgents,
+    },
+    {
+      label: "Workflow",
+      icon: <GitGraph className="h-4 w-4" />,
+      href: "/workflow",
+      active: isWorkflow,
     },
     {
       label: "API Keys",
@@ -132,8 +140,7 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
               onClick={item.onClick}
               className={cn(
                 `mx-3 flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-semibold transition",
-                "text-gray-700 hover:bg-gray-50 hover:text-gray-900 ${
-                  collapsed ? "justify-center" : ""
+                "text-gray-700 hover:bg-gray-50 hover:text-gray-900 ${collapsed ? "justify-center" : ""
                 }`
               )}
             >
