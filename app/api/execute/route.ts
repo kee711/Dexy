@@ -45,7 +45,7 @@ export async function POST(request: Request) {
     const supabase = await createClient();
     const { data: agent, error } = await supabase
       .from("agents")
-      .select<AgentRecord>(
+      .select(
         "id, name, author, description, url, category, pricing_model, price",
       )
       .eq("id", agentId)
@@ -85,7 +85,7 @@ export async function POST(request: Request) {
           );
           controller.close();
         },
-        cancel() {},
+        cancel() { },
       });
 
       return new Response(readable, {
