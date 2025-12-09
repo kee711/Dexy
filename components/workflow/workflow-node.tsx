@@ -15,12 +15,16 @@ type WorkflowNodeData = {
   prompt: string;
   output: string;
   timestamp: string;
-  isChanged?: boolean; // If this node is different from the comparison session
+  status?: string; // NEW: execution status (captured, cached_full, etc)
+  isChanged?: boolean;
 };
 
 export const WorkflowNode = memo((props: NodeProps<Node<WorkflowNodeData>>) => {
   const { data } = props;
   const [expanded, setExpanded] = useState(false);
+
+  const isCached = data.status?.startsWith("cached");
+  const cacheType = data.status === "cached_semantic" ? "Semantic Cache" : "Full Cache";
 
   const formatContent = (content: string, type: "prompt" | "output") => {
     if (!content) return `(No ${type} captured)`;
@@ -97,11 +101,18 @@ export const WorkflowNode = memo((props: NodeProps<Node<WorkflowNodeData>>) => {
               {data.agentUrl}
             </div>
           </div>
-          <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-gray-100 shadow-sm shrink-0">
-            <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
-            <span className="text-xs font-medium text-gray-700">
-              {data.ratingAvg ? data.ratingAvg.toFixed(1) : "-"}
-            </span>
+          <div className="flex flex-col gap-1 items-end">
+            <div className="flex items-center gap-1 bg-white px-2 py-1 rounded-md border border-gray-100 shadow-sm shrink-0">
+              <Star className="w-3 h-3 text-yellow-400 fill-yellow-400" />
+              <span className="text-xs font-medium text-gray-700">
+                {data.ratingAvg ? data.ratingAvg.toFixed(1) : "-"}
+              </span>
+            </div>
+            {isCached && (
+              <div className="bg-green-100 text-green-700 px-2 py-0.5 rounded text-[10px] font-bold border border-green-200 uppercase tracking-tight">
+                {cacheType}
+              </div>
+            )}
           </div>
         </div>
 

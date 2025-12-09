@@ -99,6 +99,7 @@ export function WorkflowGraph({ session, compareSession }: WorkflowGraphProps) {
           tokens: log.tokens,
           prompt: log.meta?.prompt,
           output: log.meta?.output,
+          status: log.status,
           timestamp: log.created_at,
           isChanged,
         },

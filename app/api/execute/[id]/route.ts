@@ -140,6 +140,13 @@ async function logApiKeyUsage(params: {
   }
 }
 
+// ... imports (will be handled by auto-import or manual addition if needed, I'll update entire file logic below)
+
+// NEW IMPORTS
+import { CacheService } from "@/lib/cache";
+
+// ... existing types ...
+
 export async function POST(
   req: NextRequest,
   context: { params: Promise<{ id: string }> } | any
@@ -147,19 +154,94 @@ export async function POST(
   const startedAt = Date.now();
   const params = await context.params;
   const agentId = params.id as string;
+  const cacheService = new CacheService();
 
   const supabase = await createClient();
 
-  console.log("params:", params);
-  console.log("agentId:", agentId);
+  // 0. Parse Request Body early to compute hash
+  let body: any = undefined;
+  let bodyText = "";
+  try {
+    body = await req.json();
+    bodyText = JSON.stringify(body);
+  } catch {
+    body = undefined;
+  }
 
+  const inputHash = cacheService.computeHash(bodyText + agentId);
+
+  // 1. Check Full Cache
+  const fullCacheHit = await cacheService.getFullCache(inputHash);
+  if (fullCacheHit) {
+    const usage = { tokens: 0, cost: 0, latencyMs: Date.now() - startedAt };
+
+    const apiKeyContext = await validateApiKey(req);
+    if (apiKeyContext) {
+      await logApiKeyUsage({
+        apiKeyId: apiKeyContext.apiKeyId,
+        userId: apiKeyContext.userId,
+        agentId,
+        amount: 0,
+        cost: 0,
+        tokens: 0,
+        latencyMs: usage.latencyMs,
+        status: "cached_full",
+        requestId: req.headers.get("x-request-id"),
+        prompt: bodyText,
+        normalizedOutput: typeof fullCacheHit.output === 'string' ? fullCacheHit.output : JSON.stringify(fullCacheHit.output),
+      });
+    }
+
+    return NextResponse.json({
+      ...fullCacheHit.output,
+      cache: {
+        full: true,
+        semantic: { hit: false },
+      }
+    });
+  }
+
+  // 2. Check Semantic Cache 
+  const prompt = body?.query ?? body?.input ?? body?.prompt ?? "";
+  let semanticHit = null;
+  if (typeof prompt === "string" && prompt.length > 5) {
+    semanticHit = await cacheService.getSemanticCache(prompt);
+  }
+
+  if (semanticHit) {
+    const usage = { tokens: 0, cost: 0, latencyMs: Date.now() - startedAt };
+    const apiKeyContext = await validateApiKey(req);
+    if (apiKeyContext) {
+      await logApiKeyUsage({
+        apiKeyId: apiKeyContext.apiKeyId,
+        userId: apiKeyContext.userId,
+        agentId,
+        amount: 0,
+        cost: 0,
+        tokens: 0,
+        latencyMs: usage.latencyMs,
+        status: "cached_semantic",
+        requestId: req.headers.get("x-request-id"),
+        prompt: bodyText,
+        normalizedOutput: typeof semanticHit.output === 'string' ? semanticHit.output : JSON.stringify(semanticHit.output),
+      });
+    }
+
+    return NextResponse.json({
+      ...semanticHit.output,
+      cache: {
+        full: false,
+        semantic: { hit: true, similarity: semanticHit.similarity },
+      }
+    });
+  }
+
+  // ... Agent Lookup ...
   const { data: agent, error } = await supabase
     .from("agents")
     .select("*")
     .eq("id", agentId)
     .single<AgentRow>();
-
-  console.log("agent:", agent);
 
   if (error || !agent) {
     return NextResponse.json(
@@ -181,23 +263,37 @@ export async function POST(
     );
   }
 
-  // price 는 USDC 6 decimal 기준
   const priceUnits = BigInt(Math.round(priceNumber * 10 ** 6));
+  const usdcAddress = process.env.BASE_SEPOLIA_USDC_ADDRESS || "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
-  const usdcAddress =
-    process.env.BASE_SEPOLIA_USDC_ADDRESS ||
-    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+  // ... Validation & Proxy Logic ...
 
   const apiKeyContext = await validateApiKey(req);
-  if (apiKeyContext) {
-    const { response, usage, promptText, normalizedOutput } = await proxyToUpstream(
+
+  // Helper to run proxy and cache result
+  async function runProxyAndCache() {
+    // PROXY CALL
+    const result = await proxyToUpstream(
       req,
       upstreamUrl,
       startedAt,
-      priceNumber
+      priceNumber,
+      body
     );
 
-    const usageCost = Number.isFinite(usage.cost) ? usage.cost : priceNumber;
+    // CACHE SETTING LOGIC (Moved inside helper or after helper?)
+    // Let's do it after finding result.
+    return result;
+  }
+
+  // Refactored flow:
+
+  let proxyResult;
+
+  if (apiKeyContext) {
+    proxyResult = await runProxyAndCache();
+
+    const usageCost = Number.isFinite(proxyResult.usage.cost) ? proxyResult.usage.cost : priceNumber;
 
     await logApiKeyUsage({
       apiKeyId: apiKeyContext.apiKeyId,
@@ -205,109 +301,112 @@ export async function POST(
       agentId,
       amount: priceNumber,
       cost: usageCost,
-      tokens: usage.tokens,
-      latencyMs: usage.latencyMs,
+      tokens: proxyResult.usage.tokens,
+      latencyMs: proxyResult.usage.latencyMs,
       status: priceNumber > 0 ? "captured" : "free",
       requestId: req.headers.get("x-request-id"),
-      prompt: promptText,
-      normalizedOutput: normalizedOutput,
+      prompt: proxyResult.promptText,
+      normalizedOutput: proxyResult.normalizedOutput,
+    });
+  } else if (priceUnits === BigInt(0)) {
+    proxyResult = await runProxyAndCache();
+  } else {
+    // Payment Flow
+    const paymentRequirements = buildDirectPaymentRequirements({
+      priceUnits,
+      network,
+      payTo,
+      description: description ?? undefined,
+      resource: req.nextUrl.toString(),
+      usdcAddress,
     });
 
-    return response;
-  }
+    const txHash = req.headers.get("x-tx-hash");
 
-  // 🔹 가격이 0이면 그냥 프록시 실행
-  if (priceUnits === BigInt(0)) {
-    console.log("price = 0 → free execution, skipping payment");
-    const { response } = await proxyToUpstream(req, upstreamUrl, startedAt, priceNumber);
-    return response;
-  }
-
-  const paymentRequirements = buildDirectPaymentRequirements({
-    priceUnits,
-    network,
-    payTo,
-    description: description ?? undefined,
-    resource: req.nextUrl.toString(),
-    usdcAddress,
-  });
-
-  const txHash = req.headers.get("x-tx-hash");
-
-  // 🔹 클라이언트가 아직 txHash 를 안 보냈으면 402로 요구사항 리턴
-  if (!txHash) {
-    console.log(">>> 402 paymentRequirements:", paymentRequirements);
-    return NextResponse.json(paymentRequirements, {
-      status: 402,
-      headers: {
-        "content-type": "application/json",
-        "x-402-version": "1.0",
-      },
-    });
-  }
-
-  // 🔹 txHash 가 있으면 온체인 결제 검증
-  let settlement: PaymentSettlementResult | null = null;
-  try {
-    settlement = await verifyDirectPaymentOnChain(txHash, paymentRequirements);
-    if (!settlement) {
-      console.warn("No matching on-chain payment found for txHash:", txHash);
-      return NextResponse.json(
-        {
-          ok: false,
-          error: "Payment not found or invalid for this agent",
-          requirements: paymentRequirements,
+    if (!txHash) {
+      return NextResponse.json(paymentRequirements, {
+        status: 402,
+        headers: {
+          "content-type": "application/json",
+          "x-402-version": "1.0",
         },
-        { status: 402 }
-      );
+      });
     }
-  } catch (e) {
-    console.error("Failed to verify direct payment on-chain:", e);
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Failed to verify payment on-chain",
-        requirements: paymentRequirements,
-      },
-      { status: 402 }
-    );
+
+    let settlement: PaymentSettlementResult | null = null;
+    try {
+      settlement = await verifyDirectPaymentOnChain(txHash, paymentRequirements);
+      if (!settlement) {
+        return NextResponse.json({ ok: false, error: "Payment not found or invalid", requirements: paymentRequirements }, { status: 402 });
+      }
+    } catch (e) {
+      return NextResponse.json({ ok: false, error: "Failed to verify payment", requirements: paymentRequirements }, { status: 402 });
+    }
+
+    proxyResult = await runProxyAndCache();
+
+    if (settlement && proxyResult.response) {
+      const headerValue = encodePaymentResponseHeader(settlement);
+      proxyResult.response.headers.set("X-PAYMENT-RESPONSE", headerValue);
+      proxyResult.response.headers.set("Access-Control-Expose-Headers", "X-PAYMENT-RESPONSE");
+    }
   }
 
-  // 🔹 결제가 유효하면 upstream 에이전트 호출
-  const { response: resp } = await proxyToUpstream(
-    req,
-    upstreamUrl,
-    startedAt,
-    priceNumber
-  );
+  // CACHE SETTING LOGIC
+  if (proxyResult && proxyResult.response.ok) {
+    if (proxyResult.responseBodyObj) {
+      const bodyObj = proxyResult.responseBodyObj;
 
-  // 🔹 결제 settlement 정보를 헤더로 인코딩해서 내려줌
-  if (settlement) {
-    const headerValue = encodePaymentResponseHeader(settlement);
-    resp.headers.set("X-PAYMENT-RESPONSE", headerValue);
-    resp.headers.set("Access-Control-Expose-Headers", "X-PAYMENT-RESPONSE");
+      // Cache Full
+      cacheService.setFullCache(inputHash, bodyObj).catch(err => console.error("Cache set failed:", err));
+
+      // Cache Semantic (if prompt exists)
+      if (typeof prompt === "string" && prompt.length > 5) {
+        cacheService.setSemanticCache(prompt, bodyObj).catch(err => console.error("Semantic cache set failed:", err));
+      }
+
+      // Return enriched response with cache miss info
+      // Copy headers from original response
+      const newHeaders = new Headers(proxyResult.response.headers);
+
+      return NextResponse.json({
+        ...bodyObj,
+        cache: {
+          full: false,
+          semantic: { hit: false }
+        }
+      }, {
+        status: proxyResult.response.status,
+        headers: newHeaders
+      });
+    }
   }
 
-  return resp;
+  return proxyResult.response;
 }
 
 async function proxyToUpstream(
   req: NextRequest,
   upstreamUrl: string,
   startedAt: number,
-  priceNumber: number
+  priceNumber: number,
+  preParsedBody?: any // NEW Argument
 ): Promise<{
   response: NextResponse;
   usage: { tokens: number; cost: number; latencyMs: number };
   promptText: string;
   normalizedOutput: string;
+  responseBodyObj?: any; // NEW Return field
 }> {
   try {
-    let body: any = undefined;
-    try {
-      body = await req.json();
-    } catch {
-      body = undefined;
+    let body: any = preParsedBody;
+    // If not provided, try parsing (though logic above ensures it is or is undefined)
+    if (body === undefined) {
+      try {
+        body = await req.json();
+      } catch {
+        body = undefined;
+      }
     }
 
     const promptText =
@@ -339,6 +438,9 @@ async function proxyToUpstream(
       }
     }
 
+    // Store parsed body for caching if successful
+    const responseBodyObj = parsed;
+
     if (parsed && typeof parsed === "object") {
       const normalizedOutput =
         parsed?.normalized?.output ?? parsed?.output ?? parsed?.result ?? rawText;
@@ -368,6 +470,7 @@ async function proxyToUpstream(
         usage: finalUsage,
         promptText,
         normalizedOutput: typeof normalizedOutput === 'string' ? normalizedOutput : JSON.stringify(normalizedOutput),
+        responseBodyObj: enriched // Return enriched data for caching
       };
     }
 
@@ -384,6 +487,7 @@ async function proxyToUpstream(
       usage: baseUsage,
       promptText,
       normalizedOutput: rawText,
+      responseBodyObj: normalized // Return normalized data for caching
     };
   } catch (e: any) {
     console.error("Proxy to upstream failed:", e);
