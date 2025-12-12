@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import Image from "next/image";
-import logo from "@/assets/icons/Findex-Favicon.svg";
+import logo from "@/assets/icons/dexy-logo.svg";
 
 type SidebarProps = {
   collapsed?: boolean;
@@ -97,10 +97,10 @@ export function Sidebar({ collapsed = false, onToggle }: SidebarProps) {
               hovered ? (
                 <PanelRight className="h-4 w-4" />
               ) : (
-                <Image src={logo} alt="Logo" width={24} height={40} priority />
+                <Image src={logo} alt="Logo" width={32} height={32} priority />
               )
             ) : (
-              <Image src={logo} alt="Logo" width={24} height={40} priority />
+              <Image src={logo} alt="Logo" width={32} height={32} priority />
             )}
           </button>
         </div>
