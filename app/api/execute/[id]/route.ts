@@ -3,8 +3,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { createHash, randomUUID } from "crypto";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
+
 import { createPublicClient, http, parseAbiItem, decodeEventLog } from "viem";
-import { baseSepolia } from "viem/chains";
+import { avalancheFuji } from "viem/chains";
 
 type AgentRow = {
   id: string;
@@ -16,26 +17,33 @@ type AgentRow = {
   network?: string | null;
 };
 
-type DirectAcceptOption = {
-  scheme: "direct";
-  network: string;
+type EvmNetwork = {
+  evm: {
+    chainId: number;
+    rpcUrl?: string;
+  };
+};
+
+type ExactAcceptOption = {
+  scheme: "exact";
+  network: EvmNetwork;
   resource: string;
   mimeType: string;
   maxTimeoutSeconds: number;
   asset: string;
   payTo: string;
-  value: string;
+  maxAmountRequired: string;
   description?: string;
   extra: Record<string, any>;
 };
 
-type DirectPaymentRequirements = {
+type ExactPaymentRequirements = {
   x402Version: number;
-  accepts: DirectAcceptOption[];
+  accepts: ExactAcceptOption[];
 };
 
 type PaymentSettlementResult = {
-  transaction: string; // tx hash
+  transaction: string;
   network: string;
   asset: string;
   value: string;
@@ -55,7 +63,6 @@ type ApiKeyContext = {
 };
 
 function estimateTokens(text: string) {
-  // Rough heuristic: ~4 chars per token
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
@@ -82,7 +89,6 @@ async function validateApiKey(req: NextRequest): Promise<ApiKeyContext | null> {
 
     if (error || !data || data.revoked_at) return null;
 
-    // Update last_used_at asynchronously; ignore failures.
     (async () => {
       try {
         await service
@@ -120,6 +126,7 @@ async function logApiKeyUsage(params: {
     const tokens = Number(params.tokens ?? 0);
     const cost = Number(params.cost ?? 0);
     const latency = Number(params.latencyMs ?? 0);
+
     await service.from("api_key_usage").insert({
       api_key_id: params.apiKeyId,
       user_id: params.userId,
@@ -142,16 +149,13 @@ async function logApiKeyUsage(params: {
 
 export async function POST(
   req: NextRequest,
-  context: { params: Promise<{ id: string }> } | any
+  { params }: { params: { id: string } }
 ) {
   const startedAt = Date.now();
-  const params = await context.params;
   const agentId = params.id as string;
 
   const supabase = await createClient();
-
-  console.log("params:", params);
-  console.log("agentId:", agentId);
+  console.log("[execute] agentId:", agentId);
 
   const { data: agent, error } = await supabase
     .from("agents")
@@ -159,7 +163,7 @@ export async function POST(
     .eq("id", agentId)
     .single<AgentRow>();
 
-  console.log("agent:", agent);
+  console.log("[execute] agent:", agent);
 
   if (error || !agent) {
     return NextResponse.json(
@@ -170,7 +174,6 @@ export async function POST(
 
   const upstreamUrl: string = agent.url;
   const priceNumber: number = Number(agent.price ?? 0);
-  const network: string = agent.network ?? "base-sepolia";
   const payTo: string = agent.address;
   const description: string | null = agent.description ?? null;
 
@@ -181,51 +184,44 @@ export async function POST(
     );
   }
 
-  // price 는 USDC 6 decimal 기준
+  const apiKeyContext = await validateApiKey(req);
+  if (!apiKeyContext) {
+    return NextResponse.json(
+      { ok: false, error: "Missing or invalid API key" },
+      { status: 401 }
+    );
+  }
+
   const priceUnits = BigInt(Math.round(priceNumber * 10 ** 6));
 
   const usdcAddress =
-    process.env.BASE_SEPOLIA_USDC_ADDRESS ||
-    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    process.env.AVALANCHE_FUJI_USDC_ADDRESS ??
+    "0x5425890298aed601595a70AB815c96711a31Bc65";
 
-  const apiKeyContext = await validateApiKey(req);
-  if (apiKeyContext) {
-    const { response, usage, promptText, normalizedOutput } = await proxyToUpstream(
-      req,
-      upstreamUrl,
-      startedAt,
-      priceNumber
-    );
-
-    const usageCost = Number.isFinite(usage.cost) ? usage.cost : priceNumber;
+  if (priceUnits === BigInt(0)) {
+    console.log("[execute] price=0 → free execution, skip x402");
+    const { response, usage, promptText, normalizedOutput } =
+      await proxyToUpstream(req, upstreamUrl, startedAt, priceNumber);
 
     await logApiKeyUsage({
       apiKeyId: apiKeyContext.apiKeyId,
       userId: apiKeyContext.userId,
       agentId,
-      amount: priceNumber,
-      cost: usageCost,
+      amount: 0,
+      cost: usage.cost,
       tokens: usage.tokens,
       latencyMs: usage.latencyMs,
-      status: priceNumber > 0 ? "captured" : "free",
+      status: "free",
       requestId: req.headers.get("x-request-id"),
       prompt: promptText,
-      normalizedOutput: normalizedOutput,
+      normalizedOutput,
     });
 
     return response;
   }
 
-  // 🔹 가격이 0이면 그냥 프록시 실행
-  if (priceUnits === BigInt(0)) {
-    console.log("price = 0 → free execution, skipping payment");
-    const { response } = await proxyToUpstream(req, upstreamUrl, startedAt, priceNumber);
-    return response;
-  }
-
-  const paymentRequirements = buildDirectPaymentRequirements({
+  const paymentRequirements = buildExactPaymentRequirements({
     priceUnits,
-    network,
     payTo,
     description: description ?? undefined,
     resource: req.nextUrl.toString(),
@@ -234,7 +230,6 @@ export async function POST(
 
   const txHash = req.headers.get("x-tx-hash");
 
-  // 🔹 클라이언트가 아직 txHash 를 안 보냈으면 402로 요구사항 리턴
   if (!txHash) {
     console.log(">>> 402 paymentRequirements:", paymentRequirements);
     return NextResponse.json(paymentRequirements, {
@@ -246,10 +241,9 @@ export async function POST(
     });
   }
 
-  // 🔹 txHash 가 있으면 온체인 결제 검증
   let settlement: PaymentSettlementResult | null = null;
   try {
-    settlement = await verifyDirectPaymentOnChain(txHash, paymentRequirements);
+    settlement = await verifyExactPaymentOnChain(txHash, paymentRequirements);
     if (!settlement) {
       console.warn("No matching on-chain payment found for txHash:", txHash);
       return NextResponse.json(
@@ -262,7 +256,7 @@ export async function POST(
       );
     }
   } catch (e) {
-    console.error("Failed to verify direct payment on-chain:", e);
+    console.error("Failed to verify payment on-chain:", e);
     return NextResponse.json(
       {
         ok: false,
@@ -273,22 +267,30 @@ export async function POST(
     );
   }
 
-  // 🔹 결제가 유효하면 upstream 에이전트 호출
-  const { response: resp } = await proxyToUpstream(
-    req,
-    upstreamUrl,
-    startedAt,
-    priceNumber
-  );
+  const { response, usage, promptText, normalizedOutput } =
+    await proxyToUpstream(req, upstreamUrl, startedAt, priceNumber);
 
-  // 🔹 결제 settlement 정보를 헤더로 인코딩해서 내려줌
+  await logApiKeyUsage({
+    apiKeyId: apiKeyContext.apiKeyId,
+    userId: apiKeyContext.userId,
+    agentId,
+    amount: priceNumber,
+    cost: usage.cost,
+    tokens: usage.tokens,
+    latencyMs: usage.latencyMs,
+    status: "captured",
+    requestId: req.headers.get("x-request-id"),
+    prompt: promptText,
+    normalizedOutput,
+  });
+
   if (settlement) {
     const headerValue = encodePaymentResponseHeader(settlement);
-    resp.headers.set("X-PAYMENT-RESPONSE", headerValue);
-    resp.headers.set("Access-Control-Expose-Headers", "X-PAYMENT-RESPONSE");
+    response.headers.set("X-PAYMENT-RESPONSE", headerValue);
+    response.headers.set("Access-Control-Expose-Headers", "X-PAYMENT-RESPONSE");
   }
 
-  return resp;
+  return response;
 }
 
 async function proxyToUpstream(
@@ -311,7 +313,9 @@ async function proxyToUpstream(
     }
 
     const promptText =
-      body && typeof body === "object" ? JSON.stringify(body) : String(body ?? "");
+      body && typeof body === "object"
+        ? JSON.stringify(body)
+        : String(body ?? "");
 
     const upstreamRes = await fetch(upstreamUrl, {
       method: "POST",
@@ -323,6 +327,7 @@ async function proxyToUpstream(
 
     const rawText = await upstreamRes.text();
     const latencyMs = Date.now() - startedAt;
+
     const baseUsage = {
       tokens: estimateTokens(promptText + rawText),
       cost: priceNumber ? Number(priceNumber.toFixed(3)) : 0,
@@ -341,14 +346,18 @@ async function proxyToUpstream(
 
     if (parsed && typeof parsed === "object") {
       const normalizedOutput =
-        parsed?.normalized?.output ?? parsed?.output ?? parsed?.result ?? rawText;
+        parsed?.normalized?.output ??
+        parsed?.output ??
+        parsed?.result ??
+        rawText;
+
       const upstreamUsage = parsed?.normalized?.usage ?? parsed?.usage;
       const finalUsage = upstreamUsage
         ? {
-          tokens: upstreamUsage.tokens ?? baseUsage.tokens,
-          cost: upstreamUsage.cost ?? baseUsage.cost,
-          latencyMs: upstreamUsage.latencyMs ?? baseUsage.latencyMs,
-        }
+            tokens: upstreamUsage.tokens ?? baseUsage.tokens,
+            cost: upstreamUsage.cost ?? baseUsage.cost,
+            latencyMs: upstreamUsage.latencyMs ?? baseUsage.latencyMs,
+          }
         : baseUsage;
 
       const enriched = {
@@ -367,7 +376,10 @@ async function proxyToUpstream(
         }),
         usage: finalUsage,
         promptText,
-        normalizedOutput: typeof normalizedOutput === 'string' ? normalizedOutput : JSON.stringify(normalizedOutput),
+        normalizedOutput:
+          typeof normalizedOutput === "string"
+            ? normalizedOutput
+            : JSON.stringify(normalizedOutput),
       };
     }
 
@@ -404,30 +416,35 @@ async function proxyToUpstream(
   }
 }
 
-function buildDirectPaymentRequirements(input: {
+function buildExactPaymentRequirements(input: {
   priceUnits: bigint;
-  network: string;
   payTo: string;
   description?: string;
   resource: string;
   usdcAddress: string;
-}): DirectPaymentRequirements {
-  const { priceUnits, network, payTo, description, resource, usdcAddress } =
-    input;
+}): ExactPaymentRequirements {
+  const { priceUnits, payTo, description, resource, usdcAddress } = input;
 
-  const accept: DirectAcceptOption = {
-    scheme: "direct",
-    network,
+  const accept: ExactAcceptOption = {
+    scheme: "exact",
+    network: {
+      evm: {
+        chainId: avalancheFuji.id,
+        rpcUrl:
+          process.env.AVALANCHE_FUJI_RPC_URL ??
+          avalancheFuji.rpcUrls.default.http[0],
+      },
+    },
     resource,
     mimeType: "application/json",
     maxTimeoutSeconds: 300,
     asset: usdcAddress,
     payTo,
-    value: priceUnits.toString(),
+    maxAmountRequired: priceUnits.toString(),
     description,
     extra: {
-      mode: "direct-transfer",
-      note: "Client must call ERC20.transfer() from their own wallet",
+      mode: "x402-evm-exact",
+      note: "Client must pay exact USDC amount on Avalanche Fuji",
     },
   };
 
@@ -437,24 +454,25 @@ function buildDirectPaymentRequirements(input: {
   };
 }
 
-async function verifyDirectPaymentOnChain(
+async function verifyExactPaymentOnChain(
   txHash: string,
-  requirements: DirectPaymentRequirements
+  requirements: ExactPaymentRequirements
 ): Promise<PaymentSettlementResult | null> {
   const accept = requirements.accepts[0];
 
-  const rpcUrl = process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org";
+  const rpcUrl =
+    process.env.AVALANCHE_FUJI_RPC_URL ?? avalancheFuji.rpcUrls.default.http[0];
 
   const publicClient = createPublicClient({
-    chain: baseSepolia,
+    chain: avalancheFuji,
     transport: http(rpcUrl),
   });
 
   const usdcAddress = accept.asset as `0x${string}`;
-  const expectedValue = BigInt(accept.value);
+  const expectedValue = BigInt(accept.maxAmountRequired);
   const expectedPayTo = accept.payTo.toLowerCase();
 
-  console.log("=== verifyDirectPaymentOnChain ===");
+  console.log("=== verifyExactPaymentOnChain ===");
   console.log("txHash:", txHash);
   console.log("expected usdcAddress:", usdcAddress);
   console.log("expected payTo:", expectedPayTo);
@@ -468,10 +486,6 @@ async function verifyDirectPaymentOnChain(
     console.warn("No receipt for tx:", txHash);
     return null;
   }
-
-  console.log("receipt.status:", receipt.status);
-  console.log("receipt.to:", receipt.to);
-  console.log("receipt.logs.length:", receipt.logs.length);
 
   if (receipt.status !== "success") {
     console.warn("Tx not successful or reverted:", txHash);
@@ -488,18 +502,7 @@ async function verifyDirectPaymentOnChain(
     value: bigint;
   }[] = [];
 
-  // 🔍 이 tx 안의 모든 로그를 직접 스캔하면서, usdcAddress 에서 발생한 Transfer 만 디코드
   for (const log of receipt.logs) {
-    console.log(
-      "raw log:",
-      "address=",
-      log.address,
-      "topics=",
-      log.topics,
-      "data=",
-      log.data
-    );
-
     if (log.address.toLowerCase() !== usdcAddress.toLowerCase()) continue;
 
     try {
@@ -553,9 +556,9 @@ async function verifyDirectPaymentOnChain(
 
   const settlement: PaymentSettlementResult = {
     transaction: txHash,
-    network: accept.network,
+    network: "avalanche-fuji",
     asset: usdcAddress,
-    value: accept.value,
+    value: accept.maxAmountRequired,
     from: matched.from,
     to: matched.to,
   };
