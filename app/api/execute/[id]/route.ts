@@ -1,4 +1,3 @@
-import "dotenv/config";
 import { NextRequest, NextResponse } from "next/server";
 import { createHash, randomUUID } from "crypto";
 import { createClient } from "@/lib/supabase/server";
