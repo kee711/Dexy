@@ -149,10 +149,11 @@ async function logApiKeyUsage(params: {
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   const startedAt = Date.now();
-  const agentId = params.id as string;
+  const { id } = await params;
+  const agentId = id;
 
   const supabase = await createClient();
   console.log("[execute] agentId:", agentId);
