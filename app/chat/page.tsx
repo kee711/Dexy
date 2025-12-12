@@ -25,11 +25,10 @@ import {
   Search,
 } from "lucide-react";
 
-import { createWalletClient, createPublicClient, http } from "viem";
-import { base, baseSepolia } from "viem/chains";
-import { getCurrentUser, toViemAccount } from "@coinbase/cdp-core";
-import { decodePaymentResponseHeader, type PaymentInfo } from "@/utils/x402";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
+
+import { useFetchWithPayment } from "thirdweb/react";
+import { client } from "@/lib/thirdweb/thirdwebClient";
 
 type TextMessage = {
   id: string;
@@ -305,7 +304,7 @@ async function formatWithLlm(
   }
 }
 
-export default function ChatPage({ user }: { user: ChatUser }) {
+export default function ChatPage() {
   const { setShowHeader } = useHeaderVisibility();
   const [view, setView] = useState<"landing" | "chat">("landing");
   const [prompt, setPrompt] = useState("");
@@ -327,6 +326,13 @@ export default function ChatPage({ user }: { user: ChatUser }) {
     null
   );
 
+  const { fetchWithPayment, isPending: isPaying } = useFetchWithPayment(
+    client,
+    {
+      parseAs: "text", // 서버에서 JSON 줘도, text로 받아서 formatWithLlm에 넘길 거면 이렇게
+    }
+  );
+
   useEffect(() => {
     const loadCatalogAgents = async () => {
       setCatalogLoading(true);
@@ -343,10 +349,8 @@ export default function ChatPage({ user }: { user: ChatUser }) {
 
         const sorted =
           data?.sort((a, b) => {
-            const aRating =
-              (a.rating_avg ?? 0) + (a.rating_count ?? 0) * 0.001;
-            const bRating =
-              (b.rating_avg ?? 0) + (b.rating_count ?? 0) * 0.001;
+            const aRating = (a.rating_avg ?? 0) + (a.rating_count ?? 0) * 0.001;
+            const bRating = (b.rating_avg ?? 0) + (b.rating_count ?? 0) * 0.001;
             if (bRating === aRating) {
               return (a.price ?? 0) - (b.price ?? 0);
             }
@@ -592,7 +596,6 @@ export default function ChatPage({ user }: { user: ChatUser }) {
     }
   };
 
-  // 🔥 Confirm 버튼 클릭 시: window.prompt 대신 "최종 요청 요청 모드"로 진입
   const handleConfirmClick = () => {
     if (!selectedAgentId) return;
 
@@ -629,239 +632,21 @@ export default function ChatPage({ user }: { user: ChatUser }) {
     setExecuting(true);
 
     try {
-      const currentUser = await getCurrentUser();
-      if (
-        !currentUser ||
-        !currentUser.evmAccounts ||
-        currentUser.evmAccounts.length === 0
-      ) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-wallet-${Date.now()}`,
-            kind: "text",
-            from: "ai",
-            text: "Your CDP wallet is not connected. Please connect your wallet first and then try again.",
-          },
-        ]);
-        return;
-      }
-
-      const viemAccount = await toViemAccount(currentUser.evmAccounts[0]);
-
-      const chain = baseSepolia;
-      const rpcUrl =
-        Number(chain.id) === Number(base.id)
-          ? "https://mainnet.base.org"
-          : "https://sepolia.base.org";
-
-      const walletClient = createWalletClient({
-        account: viemAccount,
-        chain,
-        transport: http(rpcUrl),
-      });
-
-      const publicClient = createPublicClient({
-        chain,
-        transport: http(rpcUrl),
-      });
-
-      const payload = { query: cleanedQuery };
+      const payload = { query: cleanedQuery, agentId: agentIdToUse };
 
       const agentName =
         recommendedAgents.find((a) => a.id === agentIdToUse)?.name ??
         agentIdToUse;
 
-      const firstRes = await fetch(`/api/execute/${agentIdToUse}`, {
+      const text = await fetchWithPayment(`/api/execute/${agentIdToUse}`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 
-      if (firstRes.status === 200) {
-        const text = await firstRes.text();
-
-        const { resultText, summaryText, images } = await formatWithLlm(
-          text,
-          cleanedQuery,
-          agentName
-        );
-
-        const execId = `exec-${Date.now()}`;
-        const executionMessage: ExecutionMessage = {
-          id: execId,
-          kind: "execution",
-          execution: {
-            agentId: agentIdToUse,
-            agentName,
-            result: resultText,
-            summary: summaryText,
-            reviewSubmitted: false,
-            rating: 5,
-            reviewText: "",
-            submitting: false,
-            reviewMessage: null,
-
-            images,
-          },
-        };
-
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-free-${Date.now()}`,
-            kind: "text",
-            from: "ai",
-            text: "이 에이전트는 무료로 실행되었어요.",
-          },
-          executionMessage,
-          {
-            id: `ai-next-${Date.now()}`,
-            kind: "text",
-            from: "ai",
-            text: "The operation has been completed. Should you have any further requests, we shall be happy to recommend another agent.",
-          },
-        ]);
-
-        setAgentExecuted(true);
-        return;
-      }
-
-      if (firstRes.status !== 402) {
-        const text = await firstRes.text();
-        const msg = `Unexpected status from execute (first call): ${firstRes.status} ${firstRes.statusText}\n\n${text}`;
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-error-${Date.now()}`,
-            kind: "text",
-            from: "ai",
-            text: `에이전트 실행에 실패했어요:\n${msg}`,
-          },
-        ]);
-        return;
-      }
-
-      const requirements: DirectPaymentRequirements = await firstRes.json();
-
-      if (!requirements.accepts || requirements.accepts.length === 0) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `ai-noaccept-${Date.now()}`,
-            kind: "text",
-            from: "ai",
-            text: "The payment requirements (paymentRequirements.accepts) are empty, so the execution cannot proceed.",
-          },
-        ]);
-        return;
-      }
-
-      const accept = requirements.accepts[0];
-
-      const usdcAddress = accept.asset as `0x${string}`;
-      const payTo = accept.payTo as `0x${string}`;
-      const valueUnits = BigInt(accept.value);
-      const humanUsdc = Number(accept.value) / 1e6;
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `ai-payinfo-${Date.now()}`,
-          kind: "text",
-          from: "ai",
-          text:
-            `Running this agent requires ${humanUsdc} USDC.\n` +
-            `I will get USDC from Your wallet to complete the payment.\n\n` +
-            `- 📡 Network: ${accept.network}\n- 🔹 To (agent): \`${payTo}\``,
-        },
-      ]);
-
-      const txHash = await walletClient.writeContract({
-        address: usdcAddress,
-        abi: [
-          {
-            type: "function",
-            name: "transfer",
-            stateMutability: "nonpayable",
-            inputs: [
-              { name: "to", type: "address" },
-              { name: "amount", type: "uint256" },
-            ],
-            outputs: [{ name: "", type: "bool" }],
-          },
-        ] as const,
-        functionName: "transfer",
-        args: [payTo, valueUnits],
-      });
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `ai-txsent-${Date.now()}`,
-          kind: "text",
-          from: "ai",
-          text:
-            "Sent a USDC transfer transaction.\n\n" +
-            `- 🔹 Tx Hash: \`${txHash}\`\n`,
-        },
-      ]);
-
-      await publicClient.waitForTransactionReceipt({ hash: txHash });
-
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `ai-txconfirmed-${Date.now()}`,
-          kind: "text",
-          from: "ai",
-          text: "The transaction has been included in the block. Once the payment is confirmed, I will proceed with the agent execution.",
-        },
-      ]);
-
-      const secondRes = await fetch(`/api/execute/${agentIdToUse}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-TX-HASH": txHash,
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const text2 = await secondRes.text();
-
-      const header2 = secondRes.headers.get("X-PAYMENT-RESPONSE");
-      if (header2) {
-        const decoded: PaymentInfo | null =
-          decodePaymentResponseHeader(header2);
-
-        if (decoded) {
-          const paidUsdc = Number(decoded.value) / 1e6;
-          const payMsg =
-            "Payment is complete.\n" +
-            `- 📡 Network: ${decoded.network}\n` +
-            `- 🔹 From: \`${decoded.from}\`\n` +
-            `- 🔹 To: \`${decoded.to}\`\n` +
-            `- 💸 Amount: ${paidUsdc} USDC\n` +
-            (decoded.explorerUrl
-              ? `- [Go to BaseScan](${decoded.explorerUrl})`
-              : "");
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `ai-paid-${Date.now()}`,
-              kind: "text",
-              from: "ai",
-              text: payMsg,
-            },
-          ]);
-        }
-      }
-
+      const rawText = typeof text === "string" ? text : String(text);
       const { resultText, summaryText, images } = await formatWithLlm(
-        text2,
+        rawText,
         cleanedQuery,
         agentName
       );
@@ -880,20 +665,24 @@ export default function ChatPage({ user }: { user: ChatUser }) {
           reviewText: "",
           submitting: false,
           reviewMessage: null,
-          images, // 🔥
+          images,
         },
       };
 
       setMessages((prev) => [
         ...prev,
+        {
+          id: `ai-paid-${Date.now()}`,
+          kind: "text",
+          from: "ai",
+          text: "The agent has been executed. Any required payment was handled automatically via x402.",
+        },
         executionMessage,
         {
           id: `ai-next-${Date.now()}`,
           kind: "text",
           from: "ai",
-          text:
-            "The agent execution and payment have both been completed. " +
-            "I can recommend another agent and help you run it if you have further requests.",
+          text: "The operation has been completed. If you have more requests, I can recommend and run further agents.",
         },
       ]);
 
@@ -1010,7 +799,6 @@ export default function ChatPage({ user }: { user: ChatUser }) {
               }))
             }
             onSubmitReview={submitReview}
-            user={user}
           />
         )}
       </div>
@@ -1182,7 +970,6 @@ function ChatView({
   onRateExecution,
   onReviewChangeExecution,
   onSubmitReview,
-  user,
 }: {
   prompt: string;
   onPromptChange: (value: string) => void;
@@ -1199,7 +986,6 @@ function ChatView({
   onRateExecution: (executionId: string, value: number) => void;
   onReviewChangeExecution: (executionId: string, value: string) => void;
   onSubmitReview: (executionId: string) => void;
-  user: ChatUser;
 }) {
   const hasRecommended = recommendedAgents.length > 0;
 
@@ -1219,11 +1005,9 @@ function ChatView({
         <header className="flex items-center justify-between">
           <div>
             <p className="text-sm uppercase tracking-[0.12em] text-gray-500">
-              {user.name ?? "Guest"}
+              Guest
             </p>
-            <h2 className="text-2xl font-semibold">
-              {user.name ?? "Guest"} chat
-            </h2>
+            <h2 className="text-2xl font-semibold">Guest chat</h2>
           </div>
         </header>
 

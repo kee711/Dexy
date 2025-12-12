@@ -23,7 +23,7 @@ export async function llmJudgeNode(
       task_inferred: "parse_error",
       dimensions: [],
       overall_score: 0.5,
-      overall_comment: "Judge 응답 JSON 파싱 실패, 기본 점수 사용",
+      overall_comment: "Judge response JSON parsing failed, default score used",
       issues: ["judge_parse_error"],
     });
 

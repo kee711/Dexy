@@ -1,39 +1,36 @@
 "use client";
 
-import { SignInModal } from "@coinbase/cdp-react";
-import { cn } from "@/lib/utils";
-import { Button } from "./ui/button";
+import { ConnectButton } from "thirdweb/react";
+import { createWallet } from "thirdweb/wallets";
+import { avalancheFuji } from "thirdweb/chains";
+import { client } from "@/lib/thirdweb/thirdwebClient";
+
+const wallets = [
+  createWallet("io.metamask"),
+  createWallet("com.coinbase.wallet"),
+  createWallet("me.rainbow"),
+];
 
 export default function SignInScreen() {
   return (
-    <div className="signin-container relative h-screen w-screen flex items-center justify-center bg-white overflow-hidden">
-      <div className="relative z-0 text-center max-w-md mx-auto px-6">
-        <div className="mb-4">
-          <h1 className="text-4xl font-bold text-black mb-4">
-            Fiverr for agent
-          </h1>
-          <h2 className="text-md  text-gray-400 mb-4">
-            Do your task using x402 Micropayments
-          </h2>
-        </div>
-        <div className="mb-8">
-          <div className="flex justify-center">
-            <div className="modern-auth-button">
-              <SignInModal>
-                <Button
-                  className="rounded-full bg-[#2c44fc] px-5 py-2 text-white shadow-md hover:bg-[#011082]"
-                  size="lg"
-                  variant="secondary"
-                >
-                  Get Started
-                </Button>
-              </SignInModal>
-            </div>
-          </div>
-        </div>
+    <div className="flex min-h-screen items-center justify-center bg-gray-50">
+      <div className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-6 shadow-sm">
+        <h1 className="flex justify-center gap-2 mb-3 text-center text-4xl font-extrabold tracking-tight">
+          Welcome to <span className="text-red-400">Dexy</span>
+        </h1>
+        <h2 className="mb-2 text-center text-xl font-bold mt-10">
+          Connecting your wallet
+        </h2>
+        <p className="mb-6 text-center text-sm text-gray-600">
+          Please log in using an external wallet
+        </p>
 
-        <div className="text-xs text-gray-400 space-y-2">
-          <p>Base • x402</p>
+        <div className="flex justify-center">
+          <ConnectButton
+            client={client}
+            wallets={wallets}
+            chain={avalancheFuji}
+          />
         </div>
       </div>
     </div>
