@@ -71,76 +71,74 @@ export function buildJudgeMessages(params: {
     {
       role: "system" as const,
       content: `
-너는 "AI 에이전트 품질 심사위원"이다.
+You are an "AI Agent Quality Assessor".
 
-에이전트가 실제로 어떤 일을 하는지 먼저 파악하고,
-그 작업 유형에 맞춰 스스로 평가 기준을 설계해서 주관적으로 평가해라.
+First, ascertain what tasks the agent actually performs,
+then design your own evaluation criteria tailored to that task type and assess it subjectively.
 
-중요:
-- 이 에이전트는 리서치, 코드 생성, PPT/문서 작성, 만화/스토리텔링, 이미지 프롬프트 생성 등
-  여러 종류가 될 수 있다.
-- 응답은 순수 텍스트가 아닐 수 있고, JSON 구조(scenario, page, panels, imageBase64 등)를 포함할 수 있다.
-- 에이전트 설명(category, description) + 실제 응답 JSON 구조를 같이 보고
-  "이 에이전트가 어떤 일을 하는지" 먼저 추론해야 한다.
+Important:
+- This agent may be of various types, such as research, code generation, PPT/document creation, comics/storytelling, image prompt generation, etc.
+- Responses may not be pure text and could include JSON structures (e.g., scenario, page, panels, imageBase64).
+- You must first infer "what this agent does" by examining both the agent description (category, description) and the actual response JSON structure together.
 
-반드시 다음 순서로 생각해:
+Always consider in the following order:
 
-1) [에이전트 메타데이터]와 [에이전트 응답(JSON)]을 읽고,
-   이 에이전트의 역할/작업 유형과 출력 형식을 한 문장으로 요약한다.
-   예) "블록체인 개념을 4컷 만화 시나리오와 레이아웃으로 구성하는 에이전트"
+1) Read the [Agent Metadata] and [Agent Response (JSON)],
+   then summarise this agent's role/task type and output format in one sentence.
+   Example: "An agent that structures blockchain concepts into four-panel comic scenarios and layouts."
 
-2) 이 작업 유형에 적합한 평가 기준 3~5개를 **네가 직접 정의**한다.
-   - 리서치/설명형: 정확성, 깊이, 균형, 출처/근거, 대상 독자에 맞는 난이도
-   - 코드 생성형: 정합성, 실행 가능성, 안전성, 구조(가독성), 설명/주석
-   - PPT/문서: 구조(도입-전개-결론), 메시지 명확성, 정보량, 시각적 힌트
-   - 만화/스토리/크리에이티브:
-       - 스토리 구조 (setup-build-twist-punchline 등)
-       - 요청/프롬프트와의 관련성
-       - 캐릭터/톤 일관성
-       - 재미/감정선/메시지 전달력
-       - 레이아웃/패널 구성의 적절성
-   - 그 외 타입도, 너가 파악한 역할에 맞춰 기준 이름을 만들면 된다.
+2) **Define yourself** 3–5 evaluation criteria suitable for this task type.
+   - Research/Explanatory: Accuracy, depth, balance, sources/evidence, difficulty level appropriate for target audience
+   - Code Generation: Consistency, executability, safety, structure (readability), explanations/comments
+   - PPT/Document: Structure (introduction-development-conclusion), message clarity, information density, visual cues
+   - Comics/Stories/Creative:
+       - Story structure (e.g., setup-build-twist-punchline)
+       - Relevance to the request/prompt
+       - Character/tone consistency
+       - Entertainment value/emotional arc/message delivery
+       - Appropriateness of layout/panel composition
+   - For other types, create criteria names aligned with the role you've identified.
 
-3) 응답 JSON의 구조와 필드들을 실제로 살펴본 후,
-   위에서 정의한 기준들에 따라 **0.0~10.0 점 (소수 첫째 자리까지)**으로 점수를 매긴다.
-   - 단순히 형식만 보고 점수를 주지 말고,
-     이 에이전트가 "자기 설명/category에 비해" 얼마나 잘 수행했는지 평가해야 한다.
-   - 예: "just-fun-comic" 모드라면 개그/부조리/리듬을 더 중시하고,
-         "explain-comic" 모드라면 개념 설명의 명확성을 더 중시한다.
+3) After examining the structure and fields of the response JSON,
+   score it on a scale of **0.0 to 10.0 (to one decimal place)** according to the criteria defined above.
+   - Do not simply score based on format alone;
+    assess how well this agent performed relative to its "self-description/category".
+   - e.g., for "just-fun-comic" mode, prioritise gags/absurdity/rhythm;
+        for "explain-comic" mode, prioritise clarity of concept explanation.
 
-4) 전체적으로 봤을 때 **0.0~10.0** 통합 점수를 매기고,
-   사용자가 이해하기 쉬운 한 문장 요약 평(overall_comment)을 작성한다.
+4) Assign an overall **0.0–10.0** integrated score,
+   and write a single-sentence summary comment (overall_comment) that is easy for users to understand.
 
-5) 눈에 띄는 문제점(폭력성/혐오, 사실 왜곡, 구조적 문제, JSON 구조 깨짐 등)이 있으면
-   issues 배열에 구체적으로 남긴다.
+5) If there are any noticeable issues (violence/hate speech, factual distortion, structural problems, JSON structure breakage, etc.),
+   record them specifically in the issues array.
 
-반드시 아래 JSON 형식으로만 답해라.
+You must answer strictly in the JSON format below.
 
 {
-  "task_inferred": "이 에이전트가 하는 일과 출력 형식 요약 (자유 텍스트)",
+  "task_inferred": "Summary of this agent's function and output format (free text)",
   "dimensions": [
-    { "name": "기준 이름", "score": 0.0-10.0, "comment": "짧은 코멘트" }
+    { "name": "Criterion name", "score": 0.0-10.0, "comment": "Brief comment" }
   ],
   "overall_score": 0.0-10.0,
-  "overall_comment": "한 문장 요약 평",
-  "issues": ["눈에 띄는 문제점1", "문제점2", ...]
+  "overall_comment": "One-sentence summary evaluation",
+  "issues": ["Notable issue 1", "Issue 2", ...]
 }
 `.trim(),
     },
     {
       role: "user" as const,
       content: `
-[에이전트 메타데이터]
+[Agent Metadata]
 name: ${agent.name}
 category: ${agent.category}
 description: ${agent.description}
-address(정보용): ${agent.address ?? "없음"}
+address(For information purposes): ${agent.address ?? "None"}
 url(API): ${agent.url}
 
-[질문 또는 요청 라벨]
+[Question or Request Label]
 ${query}
 
-[에이전트 응답(JSON)]
+[Agent Response (JSON)]
 ${safeAnswer}
 `.trim(),
     },

@@ -1,42 +1,24 @@
 import type { Metadata } from "next";
-import { Geist } from "next/font/google";
-import { ThemeProvider } from "next-themes";
-import { AppFrame } from "@/components/app-frame";
 import "./globals.css";
-import Providers from "@/components/Providers";
-
-const defaultUrl = process.env.VERCEL_URL
-  ? `https://${process.env.VERCEL_URL}`
-  : "http://localhost:3000";
+import { ThirdwebProvider } from "thirdweb/react";
+import AppFrame from "@/components/app-frame";
 
 export const metadata: Metadata = {
-  metadataBase: new URL(defaultUrl),
-  title: "Next.js and Supabase Starter Kit",
-  description: "The fastest way to build apps with Next.js and Supabase",
+  title: "My App",
+  description: "Thirdweb external wallet login",
 };
-
-const geistSans = Geist({
-  variable: "--font-geist-sans",
-  display: "swap",
-  subsets: ["latin"],
-});
 
 export default function RootLayout({
   children,
-}: Readonly<{
+}: {
   children: React.ReactNode;
-}>) {
+}) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={`${geistSans.className} antialiased`}>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <Providers> <AppFrame>{children}</AppFrame></Providers>
-        </ThemeProvider>
+    <html lang="en">
+      <body>
+        <ThirdwebProvider>
+          <AppFrame>{children}</AppFrame>
+        </ThirdwebProvider>
       </body>
     </html>
   );
